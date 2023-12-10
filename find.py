@@ -100,7 +100,7 @@ def f_invalid(path):
 
             # IF NEITHER ATOM IS H -> CLASHING_PLACEMENT
             else:
-                err_0h.add({a1_res_no, a2_res_no})
+                err_0h.add(frozenset({a1_res_no, a2_res_no}))
 
     # CHECK BONDED ATOMS
     for res_no, residue in residues.items():
