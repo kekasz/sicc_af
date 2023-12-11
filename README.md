@@ -1,4 +1,4 @@
-# sicc_af
+## sicc_af
 Structure Integrity Control and Correction for AlphaFold2 predicted proteins
 
 This script takes protonated .pdb files (using [PDB2PQR](https://academic.oup.com/nar/article/35/suppl_2/W522/2920806)) taken from [AlphaFoldDB](https://academic.oup.com/nar/article/50/D1/D439/6430488?login=false) database and returns found errors as an output dictionary. The errors are divided into 3 categories:
@@ -16,7 +16,7 @@ The output dictionary's structure is following:
    |--- H_ATM_MISPLACEMENT:
            |--- --//--
 
-## HOW TO USE:
+# HOW TO USE:
 
 Requirements:
 In order to run this script on your machine, make sure you have [Python 3.10](https://www.python.org/downloads/) with [RDKit 2023.03.2](https://www.rdkit.org/docs/Install.html) library installed.
@@ -28,5 +28,7 @@ Clone the project and run then sicc_af.py as a regular Python script with facult
 $ mkdir sicc_af
 $ cd sicc_af
 $ git clone https://github.com/kekasz/sicc_af
-<strong>$ python sicc_af.py --pdb_file /path/to/pdb/file</strong>
-
+```
+<strong>```bash
+$ python sicc_af.py --pdb_file /path/to/pdb/file
+```</strong>
