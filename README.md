@@ -7,6 +7,7 @@ This script takes protonated .pdb files (using [PDB2PQR](https://academic.oup.co
   3. Hydrogens put at invalid places
 
 The output dictionary's structure is following:
+```python
  errors
    |--- CLASHING_PLACEMENT:
            |--- \[entries\]
@@ -15,6 +16,7 @@ The output dictionary's structure is following:
            |--- --//--
    |--- H_ATM_MISPLACEMENT:
            |--- --//--
+```
 
 # how to use:
 
