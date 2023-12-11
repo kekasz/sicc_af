@@ -10,8 +10,8 @@ The output dictionary's structure is following:
 ```python
  errors
    |--- CLASHING_PLACEMENT:
-           |--- \[entries\]
-                   |--- \[RESIDUE NUMBER\]: \[atoms' to be removed NEF names\]
+           |--- entries []
+                   |--- [RESIDUE NUMBER]: atoms' to be removed NEF names []
    |--- BOND_OVEREXTENSION:
            |--- --//--
    |--- H_ATM_MISPLACEMENT:
