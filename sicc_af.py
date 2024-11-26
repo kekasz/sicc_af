@@ -2,17 +2,19 @@ from rdkit.Chem import MolFromPDBFile, rdchem
 from Bio.PDB import PDBIO, PDBParser, Select
 from os.path import basename, dirname, isdir
 from os import mkdir
+from collections import defaultdict
 # from shutil import rmtree
 from typing import Union
 from sicc_af_data import archetypes, distances, final_statuses
 
 
-class BasicAtom:
+class Atom:
     def __init__(self, rdkit_atom : rdchem.Atom):
         self._res_id = rdkit_atom.GetPDBResidueInfo().GetResidueNumber()
         self._res_name = rdkit_atom.GetPDBResidueInfo().GetResidueName()
         self._nef_name = rdkit_atom.GetPDBResidueInfo().GetName().strip()
         self._id = rdkit_atom.GetPDBResidueInfo().GetSerialNumber()
+        self.bonded_ats_nef_names = set()
 
     def get_res_id(self) -> int:
         return self._res_id
@@ -26,102 +28,58 @@ class BasicAtom:
     def get_nef_name(self) -> str:
         return self._nef_name
 
-
-class Atom(BasicAtom):
-    def __init__(self, rdkit_atom : rdchem.Atom):
-        super().__init__(rdkit_atom)
-        self.bonded_ats = dict()
-        self.clashing_ress_ats = dict()
-
-    def add_bonded_at(self, bond_at : BasicAtom):
-        nef_name = bond_at.get_nef_name()
-        self.bonded_ats[nef_name] = bond_at
-
-#1 vcelku robustný zápis. nezjednodušiť defaultdict-om? aj za cenu prepisovania nemenných údajov?
-    def add_clashing_atom(self, clash_at: BasicAtom):
-        res_idx = clash_at.get_res_id()
-        if res_idx in self.clashing_ress_ats.keys():
-            self.clashing_ress_ats[res_idx].add_atom(clash_at)
-        else:
-            self.clashing_ress_ats[res_idx] = Residue(clash_at)
-
-    def get_clashing_ress_idxs(self) -> set[int]:
-        return set(self.clashing_ress_ats.keys())
+    def add_bonded_at_nef_name(self, nef_name : str):
+        self.bonded_ats_nef_names.add(nef_name)
 
     def get_bond_ats_nef_names(self) -> set[str]:
-        return set(self.bonded_ats.keys())
+        return self.bonded_ats_nef_names
 
 
-class BasicResidue:
-    def __init__(self):
-        self._id = int()
-        self._atoms = dict()
+class Residue:
+    def __init__(self, atoms_dict: dict[int, Atom]):
+        super().__init__()
+        (self._id,) = {atom.get_id() for atom in atoms_dict.values()}
+        (self._name,) = {atom.get_res_name() for atom in atoms_dict.values()}
+        self._atoms_dict = atoms_dict
 
     def get_id(self) -> int:
         return self._id
 
-    def get_atoms(self) -> set[Union[Atom, BasicAtom]]:
-        return set(self._atoms.values())
+    def get_atoms(self) -> set[Atom]:
+        return set(self._atoms_dict.values())
 
-
-class Residue(BasicResidue):
-    def __init__(self, init_atom: Union[BasicAtom, Atom]):
-        super().__init__()
-        self._id = init_atom.get_res_id()
-        self._name = init_atom.get_res_name()
-        self._atoms = {init_atom.get_id(): init_atom}
-
-    def add_atom(self, atom : Union[BasicAtom, Atom]):
+    def add_atom(self, atom : Atom):
         idx = atom.get_id()
-        self._atoms[idx] = atom
+        self._atoms_dict[idx] = atom
 
     def get_name(self) -> str:
         return self._name
 
     def get_min_at_distance(self) -> int:
-        atom_distances = set()
-
-        for atom in self.get_atoms():
-            at_nef_name = atom.get_nef_name()
-            if len(at_nef_name) > 1 and at_nef_name != 'OXT':
-                atom_distances.add(distances[at_nef_name[1]])
-        return min(atom_distances)
+        return min({distances[atom.get_nef_name()] for atom in self.get_atoms() if len(atom.get_nef_name()) > 1})
 
     def get_ats_nef_names(self) -> set[str]:
         return {atom.get_nef_name() for atom in self.get_atoms()}
 
+    def get_ats_ids(self) -> set[int]:
+        return set(self._atoms_dict.keys())
 
-class BasicProtein:
-    def __init__(self, path: str):
-        self._residues = {}
-        self._path = path
+
+class Protein:
+    def __init__(self, residues: dict[int, Residue], path: str = None):
+        self._residues = residues
+        if path:
+            self._path = path
+            self._name = basename(path)[3:-16]
+
+    def get_atoms(self) -> set[Atom]:
+        return {atom for residue in self.get_residues() for atom in residue.get_atoms()}
 
     def get_residues(self) -> set[Residue]:
         return set(self._residues.values())
 
     def get_residue(self, res_id: int) -> Residue:
         return self._residues[res_id]
-
-
-class Protein(BasicProtein):
-    def __init__(self, path: str, residues: dict):
-        super().__init__(path)
-        self._name = basename(path)[3:-16]
-        self._residues = residues
-
-
-class ProteinErrors(BasicProtein):
-    def __init__(self, path: str):
-        super().__init__(path)
-        self._io = None
-
-    def add_atom(self, atom: Union[BasicAtom, Atom]):
-        res_id = atom.get_res_id()
-
-        if res_id in self._residues.keys():
-            self._residues[res_id].add_atom(atom)
-        else:
-            self._residues[res_id] = Residue(atom)
 
     def get_ress_ids(self) -> set[int]:
         return set(self._residues.keys())
@@ -134,15 +92,6 @@ class ProteinErrors(BasicProtein):
 
     def get_res_ats_nef_names(self, res_id) -> set[str]:
         return self._residues[res_id].get_ats_nef_names()
-
-
-class ClusterResidue:
-    def __init__(self, residue: Residue):
-        self._id = residue.get_id()
-        self._atoms = residue.get_atoms()
-
-    def get_ats_ids(self) -> set[int]:
-        return {atom.get_id() for atom in self._atoms}
 
 
 class ClusterErroneousResidue(BasicResidue):
@@ -173,7 +122,7 @@ class ClusterErroneousResidue(BasicResidue):
     def _get_original_atoms(self) -> set[Union[Atom]]:
         return set(self._original_atoms.values())
 
-    def make_error_distance(self, protein_errors: ProteinErrors):
+    def make_error_distance(self, protein_errors: Protein):
             err_ats_nef_names = protein_errors.get_res_ats_nef_names(self._id)
 
             # CHECK FOR UNSOLVABLE CHAIN ERROR
@@ -219,9 +168,9 @@ class ErrorCluster:
 
     def add_residue(self, residue: Residue):
         res_id = residue.get_id()
-        self._residues[res_id] = ClusterResidue(residue)
+        self._residues[res_id] = residue
 
-    def make_error_distances(self, protein_errors: ProteinErrors):
+    def make_error_distances(self, protein_errors: Protein):
         """Prepares cluster for the first iteration of correction."""
         for err_res in self._err_ress.values():
             err_res.make_error_distance(protein_errors)
@@ -239,7 +188,7 @@ class ErrorCluster:
     def get_status(self) -> str:
         return self._status
 
-    def get_residues(self) -> set[ClusterResidue]:
+    def get_residues(self) -> set[Residue]:
         return set(self._residues.values())
 
     def get_ats_ids(self) -> set[int]:
@@ -253,7 +202,7 @@ class ErrorCluster:
 
 
 class ErrorClusters:
-    def __init__(self, protein_errors : ProteinErrors, protein : Protein):
+    def __init__(self, protein_errors : Protein, protein : Protein):
         self._path = protein_errors.get_path()
         self._name = basename(self._path)[3:-16]
         self._correction_dir_path = f'{dirname(self._path)}/{self._name}_correction'
@@ -370,109 +319,77 @@ class ErrorClusters:
 class RDKitHandler:
     def __init__(self):
         self._path = str()
-        self._clashing_atoms = None
 
     def _load_rdkit_molecule(self):
         try:
             self._rdkit_molecule = MolFromPDBFile(self._path,
-                                       removeHs=False,
-                                       sanitize=False)
+                                                  removeHs=False,
+                                                  sanitize=False)
         except KeyError:
             print(f"ERROR! File at {self._path} does is not a valid PDB file.\n")
             exit()
 
     def _make_atoms_dict(self):
-        rdkit_atoms = self._rdkit_molecule.GetAtoms()
-        self._atoms_dict = {}
-
-        for rdkit_atom in rdkit_atoms:
-            atom = Atom(rdkit_atom)
-            atom_id = atom.get_id()
-            self._atoms_dict[atom_id] = atom
+        self._atoms_dict = {rdkit_atom.GetPDBResidueInfo().GetSerialNumber(): Atom(rdkit_atom) for rdkit_atom in self._rdkit_molecule.GetAtoms()}
+        self._clashing_ats_set = set()
 
     def _add_bonded_ats(self):
         rdkit_bonds = self._rdkit_molecule.GetBonds()
-        for bond in rdkit_bonds:
 
-            rdkit_atom1 = bond.GetBeginAtom()
-            rdkit_atom2 = bond.GetEndAtom()
-            atom1 = BasicAtom(rdkit_atom1)
-            atom2 = BasicAtom(rdkit_atom2)
+        for bond in rdkit_bonds:
+            a1_id = bond.GetBeginAtom().GetPDBResidueInfo().GetSerialNumber()
+            a2_id = bond.GetEndAtom().GetPDBResidueInfo().GetSerialNumber()
+            atom1 = self._atoms_dict[a1_id]
+            atom2 = self._atoms_dict[a2_id]
             a1_res_id = atom1.get_res_id()
             a2_res_id = atom2.get_res_id()
             a1_nef_name = atom1.get_nef_name()
             a2_nef_name = atom2.get_nef_name()
-            a1_id = atom1.get_id()
-            a2_id = atom2.get_id()
 
-            if (a1_id == 9 and a1_res_id == 51) or (a2_id == 9 and a2_res_id == 51):
-                ...
+            if {a1_nef_name, a2_nef_name} == {'SG', 'SG'}:
+                continue
 
             if a1_res_id == a2_res_id or (abs(a1_res_id - a2_res_id) == 1 and {a1_nef_name, a2_nef_name} == {'N', 'C'}):
 
-                self._atoms_dict[a1_id].add_bonded_at(atom2)
-                self._atoms_dict[a2_id].add_bonded_at(atom1)
-
-            elif {a1_nef_name, a2_nef_name} == {'SG', 'SG'}:
-                pass
+                self._atoms_dict[a1_id].add_bonded_at_nef_name(a2_nef_name)
+                self._atoms_dict[a2_id].add_bonded_at_nef_name(a1_nef_name)
 
             else:
-                self._atoms_dict[a1_id].add_clashing_atom(atom2)
-                self._atoms_dict[a2_id].add_clashing_atom(atom1)
-
-                if self._clashing_atoms is None:
-                    self._clashing_atoms = ProteinErrors(self._path)
-
-                self._clashing_atoms.add_atom(atom1)
-                self._clashing_atoms.add_atom(atom2)
-
-    def _make_residues_dict(self):
-        self._residues_dict = {}
-
-        for atom in self._atoms_dict.values():
-            res_idx = atom.get_res_id()
-
-#1 -//-
-            if res_idx not in self._residues_dict.keys():
-                self._residues_dict[res_idx] = Residue(atom)
-            else:
-                self._residues_dict[res_idx].add_atom(atom)
+                self._clashing_ats_set.add(atom1)
+                self._clashing_ats_set.add(atom2)
 
     def _make_protein(self):
-        self._protein = Protein(self._path, self._residues_dict)
+        self._protein = make_protein(set(self._atoms_dict.values()), self._path)
 
-    def get_protein(self, path: str) -> (Protein, ProteinErrors):
+    def get_protein(self, path: str) -> (Protein, set[Atom]):
         self._path = path
         self._load_rdkit_molecule()
         self._make_atoms_dict()
         self._add_bonded_ats()
-        self._make_residues_dict()
         self._make_protein()
 
-        return self._protein, self._clashing_atoms
+        return self._protein, self._clashing_ats_set
 
 
 class IntegrityChecker:
     def __init__(self):
-        self._archetypes = archetypes
         self._path = None
         self._protein = None
-        self._protein_errors = None
+        self._err_ats_set = None
         self._first_check = True
 
     def _check_atom(self):
         self._atom_invalid = True
         res_id = self._atom.get_res_id()
         res_name = self._atom.get_res_name()
-        at_id = self._atom.get_id()
         at_nef_name = self._atom.get_nef_name()
         bonded_ats_nef_names = self._atom.get_bond_ats_nef_names()
-        archetype = self._archetypes[res_name][at_nef_name]
+        archetype = archetypes[res_name][at_nef_name]
 
         if res_id == 1 and at_nef_name == 'N':
             archetype = archetype - {'C'}
 
-        elif res_id == len(self._residues):
+        elif res_id == len(self._protein.get_residues()):
             if at_nef_name == 'C':
                 archetype = archetype - {'N'}
                 archetype.add('OXT')
@@ -482,46 +399,40 @@ class IntegrityChecker:
 
         elif not self._first_check:
             if at_nef_name in {'N', 'C'}:
-                self._atom_invalid = False
-            #3 osetrit, aby okypteny atom nebol chybny
+                archetype = archetype - {'N', 'C'}
 
         if bonded_ats_nef_names == archetype:
             self._atom_invalid = False
 
+    def _make_protein_errors(self):
+        self._protein_errors = make_protein(self._err_ats_set)
+
     def _check_protein(self):
-        self._residues = self._protein.get_residues()
+        for atom in self._protein.get_atoms():
+            self._atom = atom
+            self._check_atom()
 
-        for residue in self._residues:
-            atoms = residue.get_atoms()
+            if self._atom_invalid:
+                self._err_ats_set.add(atom)
 
-            for atom in atoms:
+        self._make_protein_errors()
 
-                self._atom = atom
-                self._check_atom()
-
-                if self._atom_invalid:
-
-                    if self._protein_errors is None:
-                        self._protein_errors = ProteinErrors(self._path)
-
-                    self._protein_errors.add_atom(atom)
-
-    def get_errors_and_protein(self, path) -> (ProteinErrors, Protein):
+    def get_errors_and_protein(self, path) -> (Protein, Protein):
         self._path = path
-        self._protein, self._protein_errors = RDKitHandler().get_protein(path)
 
+        self._protein, self._err_ats_set = RDKitHandler().get_protein(path)
         self._check_protein()
 
         return self._protein_errors, self._protein
 
-    def get_errors(self, path) -> ProteinErrors:
+    def get_errors(self, path) -> Protein:
         self._first_check = False
         self._path = path
-        self._protein, self._protein_errors = RDKitHandler().get_protein(path)
+        self._protein, self._err_ats_set = RDKitHandler().get_protein(path)
 
         self._check_protein()
 
-        return self._protein_errors
+        return self._err_ats_set # ale ErrorProtein
 
 
 class BioHandler:
@@ -616,6 +527,21 @@ class StructureCorrector:
         else:
             self._execute_correction()
 
+
+def make_protein(atoms: set[Atom], path: str = None) -> Protein:
+        ress_ats_dicts_dict = defaultdict(dict)
+
+        for atom in atoms:
+            at_id = atom.get_id()
+            res_id = atom.get_res_id()
+            ress_ats_dicts_dict[res_id][at_id] = atom
+
+        residues_dict = {}
+
+        for res_id, res_ats_dict in ress_ats_dicts_dict.items():
+            residues_dict[res_id] = Residue(res_ats_dict)
+
+        return Protein(residues_dict, path)
 
 StructureCorrector().correct_structure('/home/l/pycharmprojects/sicc_af/bordel/AF-Q9Y7W4-F1-model_v4.pdb') # rozstrelený H bez clashu
 # StructureCorrector().correct_structure('/home/l/pycharmprojects/sicc_af/bordel/AF-A0A1D8PTL3-F1-model_v4.pdb') # clash 2 W
