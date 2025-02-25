@@ -3,8 +3,9 @@ from os import mkdir, system
 from os.path import basename, dirname, isdir
 from re import sub
 
-from Bio.PDB import PDBIO, PDBParser, Select
+from Bio.PDB import NeighborSearch, PDBIO, PDBParser, Select
 from rdkit.Chem import MolFromPDBFile, rdchem
+from sklearn.cluster import AgglomerativeClustering
 
 # from shutil import rmtree
 from sicc_af_data import archetypes, distance, proline_distance
@@ -19,7 +20,8 @@ class Atom:
         self.nef_name = rdkit_pdb_info.GetName().strip()
         self.id = rdkit_pdb_info.GetSerialNumber()
         self.bonded_ats_nef_names = set()
-        self.status = 'CORRECT'  # correction status
+        self.correct = True
+        self._chain_error = False
 
 
 class Residue:
@@ -35,7 +37,7 @@ class Residue:
 
         # process errors
         if err_atoms_dict:
-            self.status = 'ERRONEOUS'
+            self.correct = False
             self.min_err_distance = None
 
             # separate chain oxygen errors (they need to be treated separatedly)
@@ -53,7 +55,7 @@ class Residue:
                 else:
                     self.min_err_distance = min({distance[atom.nef_name[1]] for atom in err_atoms_dict.values()})
         else:
-            self.status = 'CORRECT'
+            self.correct = True
 
     def get_kept_ats_ids(self,
                          correction_level:  int) -> set[int]:
@@ -63,7 +65,7 @@ class Residue:
         ats_ids = set()
         for atom in self.atoms.values():
             # leave out erroneous atoms
-            if atom.status != 'ERRONEOUS' or atom.nef_name[0] == 'O':
+            if atom.correct:
                 # leave out atoms further in residue than any of the erroneous ones
                 if len(sub(r'[^a-zA-Z]', '', atom.nef_name)) == 2:
                     # purvey proline particularities
@@ -77,8 +79,13 @@ class Residue:
 
         return ats_ids
 
-    def get_ats_nef_names(self) -> set[str]:
-        return {atom.nef_name for atom in self.atoms.values()}
+
+class Cluster:
+    def __init__(self,
+                 cluster: list):
+        self.ids = cluster
+        self.correct = False
+        self.size = len(cluster)
 
 
 class Protein:
@@ -87,7 +94,8 @@ class Protein:
         """The protein is loaded from a PDB file. Error bonds are detected and corresponding atoms and residues are
         noted."""
 
-        self.status = 'CORRECT'
+        self.correct = True
+        self.clusters = None
         self.name = basename(path)[3:-16]
         self._residues = {}
         self._path = path
@@ -95,6 +103,7 @@ class Protein:
         self._chain_errors = False
         self._correction_dir_path = f'{dirname(self._path)}/{self.name}_correction'
         self._correction_level = 0
+        self._CLUSTERING_DISTANCE = 20
 
         # load RDKit molecule from PDB file
         try:
@@ -104,21 +113,26 @@ class Protein:
         except KeyError:
             exit(f"ERROR! File at {self._path} is not a valid PDB file.\n")
 
-        # make a dictionary of all protein's atoms {atom_id : Atom}
+        # make a dictionary of all protein's atoms {atom_id : Atom}, ignoring hydrogens
         atoms_dict = {rdkit_atom.GetPDBResidueInfo().GetSerialNumber(): Atom(rdkit_atom)
-                      for rdkit_atom in rdkit_molecule.GetAtoms()}
+                      for rdkit_atom in rdkit_molecule.GetAtoms()
+                      if rdkit_atom.GetPDBResidueInfo().GetName().strip()[0] != 'H'}
 
         # make a set of bonded atoms' NEF names for each atom & check for interresidual clashes
         # (check bonds detected by RDKit for atoms pairs)
         err_ats_set = set()
         chain_err_ats_set = set()
         for bond in rdkit_molecule.GetBonds():
+            # ignore bonds containing hydrogen
+            a1_nef_name = bond.GetBeginAtom().GetPDBResidueInfo().GetName().strip()
+            a2_nef_name = bond.GetEndAtom().GetPDBResidueInfo().GetName().strip()
+            if a1_nef_name[0] == 'H' or a2_nef_name[0] == 'H':
+                continue
+
             a1_id = bond.GetBeginAtom().GetPDBResidueInfo().GetSerialNumber()
             a2_id = bond.GetEndAtom().GetPDBResidueInfo().GetSerialNumber()
             atom1 = atoms_dict[a1_id]
             atom2 = atoms_dict[a2_id]
-            a1_nef_name = atom1.nef_name
-            a2_nef_name = atom2.nef_name
 
             # purvey actual disulphide bonds between cysteins' sulphurs
             if {a1_nef_name, a2_nef_name} == {'SG', 'SG'}:
@@ -136,25 +150,23 @@ class Protein:
                 self._chain_errors = True
                 chain_err_ats_set.add(atom1)
                 chain_err_ats_set.add(atom2)
-                atom1.status = 'CHAIN ERROR'
-                atom2.status = 'CHAIN ERROR'
+                atom1._chain_error = True
+                atom2._chain_error = True
 
             # else mark atoms as erroneous, if they are not chain atoms
             else:
-                self.status = 'ERRONEOUS'
+                self.correct = False
                 if a1_nef_name not in {'N', 'C', 'CA'}:
                     err_ats_set.add(atom1)
-                    atom1.status = 'ERRONEOUS'
+                    atom1.correct = False
                 if a2_nef_name not in {'N', 'C', 'CA'}:
                     err_ats_set.add(atom2)
-                    atom2.status = 'ERRONEOUS'
+                    atom2.correct = False
 
         # check if the atom is bonded to expected atoms
         ress_ids = {atom.res_id for atom in atoms_dict.values()}
         last_res_id = max(ress_ids)
         for atom in atoms_dict.values():
-            if atom.id == 2882:
-                pass
             res_id = atom.res_id
             res_name = atom.res_name
             at_nef_name = atom.nef_name
@@ -191,7 +203,7 @@ class Protein:
                         else:
                             self._chain_errors = True
                             chain_err_ats_set.add(atom)
-                            atom.status = 'CHAIN ERROR'
+                            atom._chain_error = True
                 # if there are any extra atoms bonded, mark erronous
                 if not bonded_ats_nef_names < archetype:
                     erroneous = True
@@ -209,8 +221,8 @@ class Protein:
                               if len(sub(r'[^a-zA-Z]', '', missing_at_nef_name)) == 2]): # possible number at the end of the nef name (e.g. CE1 and NE2 in HIS)
                     erroneous = True
             if erroneous:
-                self.status = 'ERRONEOUS'
-                atom.status = 'ERRONEOUS'
+                self.correct = False
+                atom.correct = False
                 err_ats_set.add(atom)
 
         # clusterize atoms and erroneous atoms into residues and erroneous residues dictionaries {residue_id : Residue}
@@ -233,129 +245,127 @@ class Protein:
         return dict(ress_ats_dicts_dict)
 
     def execute_correction(self):
-        """Makes clusters of error residues and their neighbouring residues."""
-
-        # clusterize erroneous residues into a list of sets of their ids
-
+        print(f'correction of {self.name}...')
         # load Biopython structure from the PDB file
         try:
             bio_structure = PDBParser(QUIET=True).get_structure('protein', self._path)
         except KeyError:
             exit(f"ERROR! File at {self._path} is not a valid PDB file.\n")
 
-        bio_residues = {residue.id[1]: residue for residue in bio_structure.get_residues()}
-        err_ress_ids_clusters = set()
-        left = set(self._error_residues.keys()).copy() # error resiudes not already added to a cluster
-
-        for err_res_id in self._error_residues.keys():
-            if err_res_id in left:
-                taken = {err_res_id}
-                left.remove(err_res_id)
-                growth = taken.copy()
-
-                # clusterize until the cluster stops growing
-                while growth:
-                    old_taken = taken.copy()
-
-                    # try to find nearby residues. consider left residues and the newest taken residues only
-                    for err_res_id_1 in growth:
-                        new_taken = set()
-                        for err_res_id_2 in left:
-                            # compare the distance between C-αs of the residues pair
-                            if bio_residues[err_res_id_1]['CA'] - bio_residues[err_res_id_2]['CA'] < 10:
-                                taken.add(err_res_id_2)
-                                new_taken.add(err_res_id_2)
-
-                        left = left - new_taken
-
-                    growth = taken - old_taken
-
-                err_ress_ids_clusters.add(frozenset(taken))
-
-        # execute correction over clusters
+        # this class will be used for cutting out clusters for correction into new files
         class SelectIndexedAtoms(Select):
-            def __init__(self, indices):
+            """Stores atom ids and uses them within the PDBIO class to select atoms to be copied to the new file
+            based on their id."""
+
+            def __init__(self):
                 super().__init__()
-                self.indices = indices
+                self.indices = set()
+
             def accept_atom(self, atom):
+                """Overriding the original method (see BioPython documentation)."""
                 if atom.get_serial_number() in self.indices:
                     return 1
                 else:
                     return 0
-        for cluster_err_ids in err_ress_ids_clusters:
 
-            # find surrounding residues and list their atoms' ids
-            surr_ats_ids = set()
-            left_bio_residues = {residue for residue in bio_structure.get_residues()
-                                 if residue.get_id()[1] not in self._error_residues.keys()}
-            for err_res_id in cluster_err_ids:
-                bio_err_res = bio_residues[err_res_id]
-                new_surr = set()
+            def update_indices(self, indices):
+                self.indices = indices
 
-                # select residues with CA-distance under 10 Å from any of the erroneous residues in the cluster
-                for bio_res in left_bio_residues:
-                    if bio_err_res['CA'] - bio_res['CA'] < 10:
-                        surr_res_id = bio_res.get_id()[1]
-                        surr_ats_ids.update(self._residues[surr_res_id].atoms.keys())
-                        new_surr.add(bio_res)
+        # cluster residues with regard to their centres of geometry
+        bio_residues = {residue.id[1]: residue for residue in bio_structure.get_residues()}
+        if len(self._error_residues) == 1:
+            err_ress_ids_clusters = list([self._error_residues.keys()])
+        else:
+            err_ress_centres = [bio_residues[res_id].center_of_mass(geometric=True)
+                                for res_id in sorted(self._error_residues.keys())]
+            clustering_engine = AgglomerativeClustering(n_clusters=None,
+                                                        distance_threshold=self._CLUSTERING_DISTANCE).fit(err_ress_centres)
+            err_ress_ids_clusters = [[] for _ in range(clustering_engine.n_clusters_)]
+            for cluster_id, res_id in zip(clustering_engine.labels_,
+                                          sorted(self._error_residues.keys())):
+                err_ress_ids_clusters[cluster_id].append(res_id)
+        self.clusters = [Cluster([*cluster]) for cluster in err_ress_ids_clusters]
 
-                left_bio_residues = left_bio_residues - new_surr
-
-            # try iterations of correction
-            cluster_err_ress = {res_id: self._residues[res_id] for res_id in cluster_err_ids}
-            max_error_distance = max({res.min_err_distance if res.min_err_distance else 1
-                                      for res in cluster_err_ress.values()})
-            last_err_ress = cluster_err_ress
-            correction_level = 0
-            kept_ats_ids = set()
-            io = PDBIO()
+        # execute correction over individual clusters
+        kdtree = NeighborSearch(list(bio_structure.get_atoms()))
+        surr_ats_ids = set()
+        for cluster in self.clusters:
+            # get surrounding residues' atoms' ids
+            for err_res_id in cluster.ids:
+                for residue in kdtree.search(center=bio_residues[err_res_id].center_of_mass(geometric=True),
+                                             radius=self._CLUSTERING_DISTANCE,
+                                             level='R'):
+                    res_id = residue.id[1]
+                    if res_id not in self._error_residues.keys():
+                        surr_ats_ids.update(self._residues[res_id].atoms.keys())
 
             # ensure existence of a directory for the protein's correction
             if not isdir(self._correction_dir_path):
                 mkdir(self._correction_dir_path)
 
-
-            while not all([residue.status != 'ERRONEOUS' for residue in cluster_err_ress.values()]):
-
-                if correction_level == max_error_distance:
-                    print('Correction unsuccessful!')
+            # try iterations of correction
+            cluster_err_ress = {res_id: self._residues[res_id] for res_id in cluster.ids}
+            max_error_distance = max({res.min_err_distance if res.min_err_distance else 1
+                                      for res in cluster_err_ress.values()})
+            correction_level = 1
+            io = PDBIO()
+            io.set_structure(bio_structure)
+            selector = SelectIndexedAtoms()
+            correction_attempt = self
+            while not all([correction_attempt._residues[res_id].correct for res_id in cluster_err_ress.keys()]):
+                if correction_level > max_error_distance:
                     break
 
-                io.set_structure(bio_structure)
-
-                for res_id, residue in last_err_ress.items():
-                    if residue.status == 'ERRONEOUS':
-                        kept_ats_ids = self._residues[res_id].get_kept_ats_ids(correction_level)
-                    for oxygen_id in residue.ox_errs_ats_dict.keys():
-                        kept_ats_ids.remove(oxygen_id)
-
-                selector = SelectIndexedAtoms(kept_ats_ids | surr_ats_ids)
+                # cut out the cluster's atoms into a correction file
+                kept_ats_ids = set()
+                for res_id in cluster.ids:
+                    kept_ats_ids.update(self._residues[res_id].get_kept_ats_ids(correction_level))
+                selector.update_indices(kept_ats_ids | surr_ats_ids)
                 correction_file_path = f'{self._correction_dir_path}/level{correction_level}'
                 io.save(correction_file_path + '.pdb', selector)
-                system(f'pdb2pqr30 --noopt --nodebump --pdb-output {correction_file_path}out.pdb '
+
+                # correct by propka
+                system(f'pdb2pqr30 --noopt --pdb-output {correction_file_path}out.pdb '
                        f'{correction_file_path}.pdb {self._correction_dir_path}/delete.pqr '
-                       f'--titration-state-method propka --with-ph 7.2;'
+                       f'--titration-state-method propka --with-ph 7.2  2>/dev/null;'
                        f'rm {self._correction_dir_path}/delete.pqr; rm {self._correction_dir_path}/delete.log')
 
-                correction_attempt = Protein(correction_file_path + '.pdb')
+                # check correction successfulness
+                correction_attempt = Protein(correction_file_path + 'out.pdb')
 
-                ...
                 correction_level += 1
 
+            else:
+                for res_id in cluster.ids:
+                    self._residues[res_id].correct = True
+                cluster.correct = True
 
-class StructureCorrector:
-    def __init__(self, path: str):
-        self._path = path
-        self._protein = Protein(path)
+        if all([cluster.correct for cluster in self.clusters]):
+            self.correct = True
 
-        if self._protein.status == 'CORRECT':
-            print(f'OK: No error found in {self._protein.name}.')
-        else:
-            self._protein.execute_correction()
-
-        # correction_dir_path = f"{dirname(self._path)}/{basename(self._path)[3:-16]}_correction"
-        # rmtree(correction_dir_path)
+        # print out results
+        for cluster in self.clusters:
+            for i in range(cluster.size):
+                print(f'{cluster.ids[i]}: {'success' if cluster.correct else 'failure'}', end='')
+                if i < cluster.size - 1:
+                    print(', ', end='')
+        print('')
 
 
-StructureCorrector('/home/l/pycharmprojects/sicc_af/bordel/AF-Q9Y7W4-F1-model_v4.pdb') # rozstrelený H bez clashu
-# StructureCorrector('/home/l/pycharmprojects/sicc_af/bordel/AF-A0A1D8PTL3-F1-model_v4.pdb') # clash 2 W
+
+path = '/home/l/pycharmprojects/sicc_af/bordel/AF-Q9Y7W4-F1-model_v4.pdb' # rozstrelený H bez clashu 368
+path = '/home/l/pycharmprojects/sicc_af/bordel/AF-A0A1D8PTL3-F1-model_v4.pdb' # clash 2 W 538, 542
+protein = Protein(path)
+
+if protein.correct:
+    print(f'OK: No error found in {protein.name}.')
+else:
+    protein.execute_correction()
+    if protein.correct:
+        print(f'CORRECTION SUCCESSFUL for {protein.name}')
+
+# correction_dir_path = f"{dirname(self._path)}/{basename(self._path)[3:-16]}_correction"
+# rmtree(correction_dir_path)
+
+
+
