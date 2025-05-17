@@ -165,7 +165,7 @@ class Protein:
     def __init__(self,
                  path:                      str,
                  corrected_path:            str     = None,
-                 log_file:                  str     = None,
+                 correction_dir:            str     = False,
                  delete_auxiliary_files:    bool    = True,
                  silent:                    bool    = False):
         """The protein is loaded from a PDB file. Error bonds are detected and corresponding atoms and residues are
@@ -180,17 +180,11 @@ class Protein:
         self._CLUSTERING_DISTANCE = 10
         self._SURROUNDINGS_DISTANCE = 16
         self.path = path
-        self.pdb2pqr_errors_log = None
+        self.pdb2pqr_errors_log = []
         self.final_file_path = corrected_path
         self.name = basename(path)[3:-16]
-        if self.final_file_path:
-            self.final_file_path = abspath(self.final_file_path)
-            self._correction_dir = dirname(self.final_file_path)
-        else:
-            self._correction_dir = f'{dirname(self.path)}/sicc_af/{self.name}_correction'
-        if log_file is None:
-            self.log_file = self._correction_dir + '/log.txt'
-        self.log_file = log_file
+        self._correction_dir = correction_dir
+        self.log = ''
         self._correction_level = 0
         self.error_residues = {}
         self.residues = {}
@@ -356,10 +350,6 @@ class Protein:
         return dict(ress_ats_dicts_dict)
 
     def execute_correction(self):
-        if not self.final_file_path:
-            self.final_file_path = f'{dirname(self.path)}/sicc_af/{splitext(self.filename)[0]}_corrected.pdb'
-        else:
-            self.final_file_path = f'{dirname(self.path)}/sicc_af/{self.final_file_path}'
 
         # load Biopython structure from the PDB file
         bio_structure = PDBParser(QUIET=True).get_structure('protein', self.path)
@@ -421,7 +411,6 @@ class Protein:
                          in zip(err_ress_ids_clusters, cluster_surr_ress, cluster_surr_ats)]
 
         # execute correction over individual clusters
-        self.pdb2pqr_errors_log = []
         io = PDBIO()
         io.set_structure(bio_structure)
         selector = SelectIndexedAtoms()
@@ -429,7 +418,7 @@ class Protein:
             cluster_id += 1
             print_output(f'INFO: correcting cluster {cluster_id}: residues {'+'.join(cluster.ids_strs)}', self._silent)
 
-            # ensure existence of a directory for the protein's correction
+            # ensure existence of a directory for the current correction level
             correction_dir = f'{self._correction_dir}/cluster_{cluster_id}'
             makedirs(name       = correction_dir,
                      exist_ok   = True)
@@ -481,7 +470,7 @@ class Protein:
                         if line[0:39] == 'ERROR:This PDB file is missing too many':
                             self.pdb2pqr_errors_log.append(cluster_id)
                             print_output(f'ERROR: The level {correction_level} cutout {line[15:108]} {line[108:-1]}', False)
-                            self.log_file += f'ERROR: The level {correction_level} cutout {line[15:108]} {line[108:]}'
+                            self.log += f'ERROR: The level {correction_level} cutout {line[15:108]} {line[108:]}'
 
                             pdb2pqr_problem = True
                             break
@@ -499,7 +488,7 @@ class Protein:
 
                 cluster.correct = True
                 cluster.iterations = correction_level - 1
-                cluster.file = self._correction_dir + f'/cluster_{cluster_id}{debump_flag}.pdb'
+                cluster.file = f'{correction_dir}{debump_flag}.pdb'
                 replace(src = output_file,
                         dst = cluster.file)
 
@@ -519,10 +508,6 @@ class Protein:
                         continue
         io.save(self.final_file_path)
 
-        # delete auxiliary files (if demanded)
-        if self._delete_auxiliary_files:
-            rmtree(self._correction_dir)
-
 
 class StructureIntegrityCheckerAndCorrector:
     def __init__(self,
@@ -531,7 +516,7 @@ class StructureIntegrityCheckerAndCorrector:
                  logger                 : Logger    = None,
                  log_file               : str       = None,
                  delete_auxiliary_files : bool      = False,
-                 silent                 : bool      = False):
+                 silent                 : bool      = True):
 
         # control usability of files
         if not isfile(input_pdb_file):
@@ -542,7 +527,12 @@ class StructureIntegrityCheckerAndCorrector:
             exit(3)
 
         self._input_PDB_file = abspath(input_pdb_file)
-        self._output_PDB_file = output_pdb_file
+        defaultdir = f'{dirname(self._input_PDB_file)}/sicc_af'
+        self._correction_dir = f'{defaultdir}/{basename(self._input_PDB_file)[3:-16]}_correction'
+        if output_pdb_file:
+            self._output_PDB_file = abspath(output_pdb_file)
+        else:
+            self._output_PDB_file = f'{defaultdir}/{splitext(basename(self._input_PDB_file))[0]}_corrected.pdb'
         self._logger = logger
         self._log = ''
         self._log_file = log_file
@@ -553,7 +543,7 @@ class StructureIntegrityCheckerAndCorrector:
         print_output('INFO: loading file...', self._silent)
         protein = Protein(self._input_PDB_file,
                           self._output_PDB_file,
-                          self._log,
+                          self._correction_dir,
                           self._delete_auxiliary_files,
                           self._silent)
         print_output(f'INFO: {protein.filename} loaded', self._silent)
@@ -561,19 +551,15 @@ class StructureIntegrityCheckerAndCorrector:
         if protein.correct and protein.chain_correct:
             print_output(f'OK: No error found in {protein.filename}.', self._silent)
         else:
-            # prepare directory for the log file
-            if not self._log_file:
-                self._log_file = f'{dirname(self._input_PDB_file)}/sicc_af/{basename(self._input_PDB_file)[3:-16]}_correction/log.txt'
-            else:
-                self._log_file = abspath(self._log_file)
-            makedirs(name       = dirname(self._log_file),
+            # prepare the correction directory
+            makedirs(name       = self._correction_dir,
                      exist_ok   = True)
 
             self._log += f'{protein.name}:\n'
             erroneous_correction = False
             if not protein.correct:
                 protein.execute_correction()
-                self._log += protein.log_file
+                self._log += protein.log
                 listed_results = [[', '.join(cluster.ids_strs), 'success' if cluster.correct else 'failure']
                                   for cluster in protein.clusters]
                 table = tabulate(tabular_data   = listed_results,
@@ -590,7 +576,7 @@ class StructureIntegrityCheckerAndCorrector:
 
                 # run a check of the final file
                 persistent_side_chain_errors = protein.error_residues.keys() - {res_id for cluster in protein.clusters if cluster.correct for res_id in cluster.ids}
-                final_protein = Protein(protein.final_file_path)
+                final_protein = Protein(self._output_PDB_file)
                 if final_protein.error_residues.keys() != persistent_side_chain_errors or final_protein.main_chain_errors != protein.main_chain_errors:
                     print_output('ERROR: pdb2pqr failed to correct the protein.', self._silent)
                     for cluster in protein.clusters:
@@ -611,7 +597,7 @@ class StructureIntegrityCheckerAndCorrector:
             if not protein.chain_correct:
                 print_output(f'INFO: In {protein.filename}, backbone errors were found in these residues:', self._silent)
                 protein_chain_errors = protein.main_chain_errors
-                chain_errors_string = '    ' + '; '.join(list(map(str, protein_chain_errors)))
+                chain_errors_string = '; '.join(list(map(str, protein_chain_errors)))
                 print_output(chain_errors_string, self._silent)
                 self._log += (f'--------------------------\n'
                               f'Chain errors\n'
@@ -624,10 +610,24 @@ class StructureIntegrityCheckerAndCorrector:
                                                                     for error in protein_chain_errors]
 
             if erroneous_correction:
-                self._log += 'ERROR: pdb2pqr failed to correct the protein.\n'
+                self._log += 'ERROR: PDB2PQR failed to correct the protein.\n'
+
+            # delete auxiliary files (if demanded)
+            if self._delete_auxiliary_files:
+                rmtree(self._correction_dir)
+
+            # write the log file
             self._log += '\n'
-            with open(self._log_file, mode='a') as log_file:
-                log_file.write(self._log)
+            if self._log_file:
+                self._log_file = abspath(self._log_file)
+                makedirs(name       =dirname(self._log_file),
+                         exist_ok   = True)
+                with open(self._log_file, mode='a') as log_file:
+                    log_file.write(self._log)
+            elif not self._delete_auxiliary_files:
+                self._log_file = f'{self._correction_dir}/log.txt'
+                with open(self._log_file, mode='a') as log_file:
+                    log_file.write(self._log)
 
             if erroneous_correction:
                 exit(5)
