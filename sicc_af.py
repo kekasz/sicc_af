@@ -4,6 +4,7 @@ from os import makedirs, system, replace
 from os.path import abspath, basename, dirname, isfile, splitext
 from re import sub
 from shutil import rmtree
+from typing import Optional
 
 from tabulate import tabulate
 
@@ -11,8 +12,12 @@ from Bio.PDB import NeighborSearch, PDBIO, PDBParser, Select
 from rdkit.Chem import MolFromPDBFile, rdchem
 from sklearn.cluster import AgglomerativeClustering
 
-from logger import Logger
 from sicc_af_data import archetypes, distance, proline_distance
+# for batch run use
+try:
+    from logger import Logger
+except ModuleNotFoundError:
+    pass
 
 
 def load_arguments():
@@ -109,6 +114,8 @@ class Residue:
                          correction_level:  int) -> set[int]:
         """Returns ids of atoms to be copied into a correction file."""
 
+        if self._id == 72:
+            pass
         # select atoms to be kept
         ats_ids = set()
         # for the case there are only oxygen errors
@@ -120,10 +127,10 @@ class Residue:
                 # leave out erroneous atoms, including erroneous oxygens
                 if atom.correct:
                     # leave out atoms further in residue than any of the erroneous ones
-                    if len(sub(r'[^a-zA-Z]', '', atom.nef_name)) == 2:
+                    if len(sub(r'[^a-zA-Z]', '', atom.nef_name)) == 2 and atom.nef_name != 'CA':
                         # purvey proline particularities
                         if (self.name == 'PRO'
-                                and proline_distance[atom.nef_name[1]] < self.min_err_distance - correction_level):
+                                and proline_distance[atom.nef_name[1]] <= self.min_err_distance - correction_level):
                             ats_ids.add(atom.id)
                         elif distance[atom.nef_name[1]] <= self.min_err_distance - correction_level:
                             ats_ids.add(atom.id)
@@ -461,7 +468,7 @@ class Protein:
                 # correct by propka
                 system(f'pdb2pqr30 {pdb2pqr_nodebump} --noopt --pdb-output {output_file} '
                        f'{cutout_file} {correction_dir}/delete.pqr '
-                       f'--titration-state-method propka --with-ph 7.2 2>{pdb2pqr_log};'
+                       f'2>{pdb2pqr_log};'
                        f'rm {correction_dir}/delete.*;')
 
                 # check if the outcut cluster was not too small for pdb2pqr
@@ -512,11 +519,11 @@ class Protein:
 class StructureIntegrityCheckerAndCorrector:
     def __init__(self,
                  input_pdb_file         : str,
-                 output_pdb_file        : str       = None,
-                 logger                 : Logger    = None,
-                 log_file               : str       = None,
-                 delete_auxiliary_files : bool      = False,
-                 silent                 : bool      = True):
+                 output_pdb_file        : str               = None,
+                 logger                 : Optional[Logger]  = None,
+                 log_file               : str               = None,
+                 delete_auxiliary_files : bool              = False,
+                 silent                 : bool              = True):
 
         # control usability of files
         if not isfile(input_pdb_file):
