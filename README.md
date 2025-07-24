@@ -9,16 +9,17 @@ It uses following libraries: [Biopython](https://doi.org/10.1093/bioinformatics/
 suite.
 
 ## Command line use
-sicc_αf setup:
+setup:
 
 ```bash
 $ git clone https://github.com/kekasz/sicc_af
 $ cd sicc_af/
-$ sudo python3.12 -m venv venv
+$ sudo python3.12 -m venv sicc_af
+$ source sicc_af/bin/activate
 $ pip install -r requirements.txt
 ```
 
-sicc_αf run manual:
+running:
 
 ```
 $ python sicc_af.py <input> [output] [-l log] [-d -s]
@@ -27,7 +28,7 @@ $ python sicc_af.py <input> [output] [-l log] [-d -s]
 input: path to PDB file to proccess with sicc_αf (mandatory)\
 output: path for the corrected file (optional)\
 log: path for the log file (optional, must be preceded by -l)\
--d: delete auxilliary files (also deletes the log file, if its path has not been specified)
+-d: delete auxilliary files (also deletes the log file, if its path has not been specified)\
 -s: silent mode
 
 ## Python library integration
