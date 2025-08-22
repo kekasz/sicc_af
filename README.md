@@ -14,8 +14,8 @@ setup:
 ```bash
 $ git clone https://github.com/kekasz/sicc_af
 $ cd sicc_af/
-$ sudo python3.12 -m venv sicc_af
-$ source sicc_af/bin/activate
+$ sudo python3.12 -m venv venv_sicc_af
+$ source venv_sicc_af/bin/activate
 $ pip install -r requirements.txt
 ```
 
