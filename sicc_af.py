@@ -1,5 +1,6 @@
 from argparse import ArgumentParser
 from collections import defaultdict
+# from json import dump
 from numpy import array, float32
 from numpy.linalg import norm as euclidean_distance
 from numpy.typing import NDArray
@@ -10,8 +11,10 @@ from sys import exit
 from shutil import rmtree
 from tabulate import tabulate
 
-from Bio.PDB import NeighborSearch, PDBIO, PDBParser, Select
+from Bio.PDB import PDBIO, PDBParser, Select
+from Bio.PDB.NeighborSearch import NeighborSearch as BioNeighbourSearch
 from Bio.PDB.Residue import Residue as BioResidue
+from Bio.PDB.Structure import Structure as BioStructure
 from rdkit.Chem import MolFromPDBFile
 from rdkit.Chem.rdchem import Atom as RDAtom
 from sklearn.cluster import AgglomerativeClustering
@@ -80,7 +83,8 @@ class Residue:
     def __init__(self,
                  atoms              : dict[int, Atom],
                  missing_bonds      : set[tuple[str, str]],
-                 side_chain_err_ats : dict[int, Atom] = None):
+                 side_chain_err_ats : dict[int, Atom]
+                 ):
 
         self.atoms = atoms
         self.atoms_by_name          : dict[str, Atom]               = {atom.name: atom for atom in atoms.values()}
@@ -106,7 +110,7 @@ class Residue:
         if side_chain_err_ats:
             # separate backbone oxygen errors (they need to be treated separatedly)
             for at_id, atom in side_chain_err_ats.items():
-                if atom.name[0] == 'O':
+                if atom.name in {'O', 'OXT'}:
                     self._ox_err_ats[at_id] = atom
             for at_id in self._ox_err_ats.keys():
                     del self.side_chain_err_atoms[at_id]
@@ -173,12 +177,13 @@ class Cluster:
                  surr_ress          : set[Residue],
                  err_cyclic_ress    : set[Residue]):
 
-        self.correct_side_chain_wise = False
-        self.debump = False
-        self.file = None
-        self.iterations = 0
-        self.pdb2pqr_error = False
-        self.surr_ats_ids       : set[int] = {atom for res in surr_ress for atom in res.atoms.keys()}
+        self.correct_side_chain_wise    = False
+        self.debump                     = False
+        self.file                       = ''
+        self.inner_cluster  : set[int]  = set()
+        self.iterations                 = 0
+        self.pdb2pqr_error              = False
+        self.surr_ats_ids   : set[int]  = {atom for res in surr_ress for atom in res.atoms.keys()}
 
         # determine error type (0 = other error type, 1 = HIS type 1, 2 = HIS type 2, +3 = cycle clash, +6 = proline cycle clash)
         self.error_type = 0
@@ -229,6 +234,7 @@ class Protein:
                  path           : str,
                  corrected_path : str     = None,
                  correction_dir : str     = False,
+                 replica_process: bool    = False,
                  silent         : bool    = False):
         """The protein is loaded from a PDB file. Error bonds are detected and corresponding atoms and residues are
         noted and clustered."""
@@ -251,8 +257,6 @@ class Protein:
                                    if rdkit_atom.GetPDBResidueInfo().GetName().strip()[0] != 'H'}
 
         # make a set of bonded atoms' NEF names for each atom & check for interresidual clashes
-        self.backbone_correct = True
-        self.side_chains_correct = True
         backbone_err_ress   : set[tuple[int, ...]]  = set()
         side_chain_err_ats  : set[Atom]             = set()
         for bond in rdkit_molecule.GetBonds():
@@ -282,24 +286,6 @@ class Protein:
                 else:
                     atom1.bonded_ats_names[a2_name] = atom2
                     atom2.bonded_ats_names[a1_name] = atom1
-                # else:
-                #     # validate the bond if it is in a cycle
-                #     res_name = atom1.res_name
-                #     res_id = atom1.res_id
-                #     bond_valid = True
-                #     if res_name in cyclic_residues_names and ats_names in cyclic_bonds[res_name]:
-                #         a1_bio = self._bio_structure[0]['A'][(' ', res_id, ' ')][a1_name]
-                #         a2_bio = self._bio_structure[0]['A'][(' ', res_id, ' ')][a2_name]
-                #         bond_length = (a1_bio - a2_bio).item()
-                #         if res_name == 'PRO':
-                #             if bond_length > 1.7:
-                #                 bond_valid = False
-                #         elif bond_length > 1.5:
-                #             bond_valid = False
-                #
-                #     if bond_valid:
-                #         atom1.bonded_ats_names.add(a2_name)
-                #         atom2.bonded_ats_names.add(a1_name)
 
             elif ((a2_res_id - a1_res_id == 1 and (a1_name, a2_name) == ('C', 'N'))
                     or (a1_res_id - a2_res_id == 1 and (a1_name, a2_name) == ('N', 'C'))):
@@ -308,14 +294,12 @@ class Protein:
 
             # detect interresidual clashes of backbone atoms
             elif ats_names < {'N', 'C', 'CA'}:
-                self.backbone_correct = False
                 backbone_err_ress.add(tuple(sorted([a1_res_id, a2_res_id])))
                 atom1.correct_in_backbone = False
                 atom2.correct_in_backbone = False
 
             # else mark atoms as erroneous, if they are not backbone atoms
             else:
-                self.side_chains_correct = False
                 if a1_name not in {'N', 'C', 'CA'}:
                     side_chain_err_ats.add(atom1)
                     atom1.correct_in_side_chain = False
@@ -328,7 +312,11 @@ class Protein:
         last_res_id = max(ress_ids)
         missing_bonds: set[tuple[int, tuple[str, str]]] = set()
         for atom in atoms.values():
+            # ignore eventual hydrogens
             at_name = atom.name
+            if at_name[0] == 'H':
+                continue
+
             res_name = atom.res_name
             archetype: set[str] = archetypes[res_name][at_name]
             res_id = atom.res_id
@@ -354,18 +342,16 @@ class Protein:
             bonded_ats_names = atom.bonded_ats_names.keys()
             correct_in_side_chain = True
             if bonded_ats_names != archetype:
-                # if oxygen, mark as erroneous
+                # if backbone oxygen, mark as erroneous
                 if at_name in {'O', 'OXT'}:
                     correct_in_side_chain = False
 
                 else:
                     # note backbone errors
                     if at_name == 'CA' and not {'N', 'C'} <= bonded_ats_names:
-                        self.backbone_correct = False
                         atom.correct_in_backbone = False
                         backbone_err_ress.add((res_id,))
                     elif at_name == 'N' and {'C'} & archetype != {'C'} & bonded_ats_names:
-                        self.backbone_correct = False
                         atom.correct_in_backbone = False
                         backbone_err_ress.add((res_id - 1, res_id))
 
@@ -389,34 +375,35 @@ class Protein:
                             correct_in_side_chain = False
 
                 if not correct_in_side_chain:
-                    self.side_chains_correct = False
                     atom.correct_in_side_chain = False
                     side_chain_err_ats.add(atom)
 
                 # note missing bonds
                 for bonded_at_name in archetype - bonded_ats_names:
                     if (at_name, bonded_at_name) != ('N', 'C'):
-                        # noinspection PyTypeChecker
                         missing_bonds.add((res_id, tuple(sorted([at_name, bonded_at_name]))))
 
+        # summarize heretofore results
+        self.side_chains_correct    = False if side_chain_err_ats else True
+        self.backbone_correct       = False if backbone_err_ress else True
         ress_ats = self._make_ress_ats_dicts_dict(set(atoms.values()))
         side_chain_err_ress_ats = self._make_ress_ats_dicts_dict(side_chain_err_ats)
-        self.residues: dict[int, Residue] = {res_id: Residue(atoms                = res_ats_dict,
-                                                             missing_bonds        = {bond[1] for bond in missing_bonds if bond[0] == res_id},
-                                                             side_chain_err_ats   = side_chain_err_ress_ats[res_id] if res_id in side_chain_err_ress_ats.keys()
-                                                                                                                    else None)
+        self.residues: dict[int, Residue] = {res_id: Residue(atoms              = res_ats_dict,
+                                                             missing_bonds      = {bond[1] for bond in missing_bonds if bond[0] == res_id},
+                                                             side_chain_err_ats = side_chain_err_ress_ats[res_id] if res_id in side_chain_err_ress_ats.keys()
+                                                                                                                  else None)
                                              for res_id, res_ats_dict in ress_ats.items()}
 
         # prepare for correction if necessary
-        if not self.side_chains_correct:
-            self._bio_structure = PDBParser(QUIET=True).get_structure('protein', path)
-            clustering_distance = 10
-            self._correction_dir = correction_dir
-            self._final_file_path = corrected_path
-            cycle_distance = 1
-            self.log = ''
-            self.pdb2pqr_errors_log: list[tuple[int, list[tuple[int, float]]]] = []
-            surroundings_distance = 15
+        if not self.side_chains_correct and not replica_process:
+            self._bio_structure     : BioStructure                              = PDBParser(QUIET=True).get_structure('protein', path)
+            clustering_distance                                                 = 10
+            self._correction_dir                                                = correction_dir
+            self._final_file_path   : str                                       = corrected_path
+            cycle_distance                                                      = 1
+            self.log                                                            = ''
+            self.pdb2pqr_errors_log : list[tuple[int, list[tuple[int, float]]]] = []
+            self._surroundings_distance                                         = 15
 
             # cluster erroneous residues with regard to their centres of geometry
             bio_residues : dict[int, BioResidue] = {residue.id[1]: residue
@@ -428,6 +415,7 @@ class Protein:
                 side_chain_err_ress_centres = [bio_residues[res_id].center_of_mass(geometric=True)
                                                for res_id in sorted(side_chain_err_ress_ats.keys())]
                 clustering_engine = AgglomerativeClustering(n_clusters          = None,
+                                                            linkage             = 'single',
                                                             distance_threshold  = clustering_distance).fit(side_chain_err_ress_centres)
                 side_chain_err_ress_clusters = [set() for _ in range(clustering_engine.n_clusters_)]
                 for cluster_id, res_id in zip(clustering_engine.labels_,
@@ -435,19 +423,14 @@ class Protein:
                     side_chain_err_ress_clusters[cluster_id].add(self.residues[res_id])
 
             # get surrounding residues for each cluster
-            kdtree = NeighborSearch(list(self._bio_structure.get_atoms()))
-            clusters_surr_ress      : list[set[Residue]]    = []
-            for cluster in side_chain_err_ress_clusters:
-                surr_ress_ids = set()
-                for side_chain_err_res in cluster:
-                    for residue in set(kdtree.search(center = bio_residues[side_chain_err_res.id].center_of_mass(geometric=True),
-                                                     radius = surroundings_distance,
-                                                     level  = 'R')):
-                        res_id = residue.id[1]
-                        if res_id not in side_chain_err_ress_ats.keys():
-                            surr_ress_ids.add(res_id)
-
-                clusters_surr_ress.append({self.residues[res_id] for res_id in surr_ress_ids})
+            kdtree              : BioNeighbourSearch    = BioNeighbourSearch(list(self._bio_structure.get_atoms()))
+            clusters_surr_ress  : list[set[Residue]]    = []
+            for cluster_ress in side_chain_err_ress_clusters:
+                clusters_surr_ress.append({self.residues[res_id]
+                                           for res_id in self._find_neighbours_ids(bio_residues    = bio_residues,
+                                                                                   cluster_ress    = cluster_ress,
+                                                                                   kdtree          = kdtree,
+                                                                                   limit           = self._surroundings_distance)})
 
             # detect errors related to bonds stretching through a cycle
             clusters_err_cyclic_ress: list[set[Residue]] = []
@@ -479,29 +462,43 @@ class Protein:
                 cluster_cyclic_ress = {res for res in cluster_err_ress | cluster_surr_ress
                                        if res.name in residues_cycles_atoms.keys()}
                 cluster_err_cyclic_ress = set()
-                for res in cluster_err_ress | cluster_surr_ress:
-                    for atoms, centre in res.missing_bonds.items():
-                        for cyclic_res in cluster_cyclic_ress - {res}:
-                            for i, cycle_centre in enumerate(cyclic_res.cycle_centres):
-                                if euclidean_distance(centre - cycle_centre) < cycle_distance:
-                                    cyclic_res.mark_cycle_erroneous(i)
-                                    side_chain_err_ress_ats[cyclic_res.id] = cyclic_res.side_chain_err_atoms
-                                    cluster_err_ress.add(cyclic_res)
-                                    cluster_surr_ress.discard(cyclic_res)
-                                    cluster_err_cyclic_ress.add(cyclic_res)
-                                    if res.name == 'PRO':
-                                        backbone_err_ress.add((cyclic_res.id,))
+                new_err_ress = cluster_err_ress.copy()
+                while new_err_ress:
+                    err_ress = new_err_ress.copy()
+                    new_err_ress = set()
+                    for res in err_ress:
+                        for atoms, centre in res.missing_bonds.items():
+                            for cyclic_res in cluster_cyclic_ress - {res}:
+                                for i, cycle_centre in enumerate(cyclic_res.cycle_centres):
+                                    if euclidean_distance(centre - cycle_centre) < cycle_distance:
+                                        cyclic_res.mark_cycle_erroneous(i)
+                                        side_chain_err_ress_ats[cyclic_res.id] = cyclic_res.side_chain_err_atoms
+                                        cluster_surr_ress.discard(cyclic_res)
+                                        if cyclic_res not in cluster_err_ress:
+                                            new_err_ress.add(cyclic_res)
+                                        cluster_err_ress.add(cyclic_res)
+                                        if res.name == 'PRO':
+                                            backbone_err_ress.add((cyclic_res.id,))
+                                        cluster_err_cyclic_ress.add(cyclic_res)
                 clusters_err_cyclic_ress.append(cluster_err_cyclic_ress)
+
+                # add neighbours of detected erroneous cyclic residues to the surrounding residues
+                if cluster_err_cyclic_ress:
+                    cluster_surr_ress = ({self.residues[res_id]
+                                          for res_id in self._find_neighbours_ids(bio_residues   = bio_residues,
+                                                                                  cluster_ress   = cluster_err_ress,
+                                                                                  kdtree         = kdtree,
+                                                                                  limit          = self._surroundings_distance)})
 
             # make cluster objects
             self.clusters: list[Cluster] = [Cluster(err_ress, surr_ress, err_cyclic_ress)
                                             for err_ress, surr_ress, err_cyclic_ress in zip(side_chain_err_ress_clusters, clusters_surr_ress, clusters_err_cyclic_ress)]
 
-        # arrange errors
-        self.backbone_err_ress  : list[int]             = sorted(res_id for err in backbone_err_ress for res_id in err)
-        self.backbone_errors    : list[tuple[int, ...]] = sorted(backbone_err_ress, key = lambda x: x[0])
-        self.side_chain_err_ress: dict[int, Residue]    = {res_id: self.residues[res_id]
-                                                           for res_id in side_chain_err_ress_ats.keys()}
+        # arrange errors in the primary object
+        if not replica_process:
+            self.side_chain_err_ress: set[int]              = set(side_chain_err_ress_ats.keys())
+            self.backbone_err_ress  : list[int]             = sorted(set(res_id for err in backbone_err_ress for res_id in err))
+            self.backbone_errors    : list[tuple[int, ...]] = sorted(backbone_err_ress, key = lambda x: x[0])
 
     @staticmethod
     def _make_ress_ats_dicts_dict(atoms: set[Atom]) -> dict[int, dict[int, Atom]]:
@@ -509,6 +506,23 @@ class Protein:
         for atom in atoms:
             ress_ats_dicts_dict[atom.res_id][atom.id] = atom
         return dict(ress_ats_dicts_dict)
+
+    @staticmethod
+    def _find_neighbours_ids(bio_residues   : dict[int, BioResidue],
+                             cluster_ress   : set[Residue],
+                             kdtree         : BioNeighbourSearch,
+                             limit          : int|float) -> set[int]:
+        err_ress_ids: set[int]  = {res.id for res in cluster_ress}
+        neighbours  : set[int]  = set()
+        for side_chain_err_res in cluster_ress:
+            for residue in set(kdtree.search(center = bio_residues[side_chain_err_res.id].center_of_mass(geometric=True),
+                                             radius = limit,
+                                             level  = 'R')):
+                res_id = residue.id[1]
+                if res_id not in err_ress_ids:
+                    neighbours.add(res_id)
+
+        return neighbours
 
     def execute_correction(self):
         """Execute correction over individual clusters"""
@@ -534,7 +548,8 @@ class Protein:
             pdb2pqr_problem = False
             pdb2pqr_nodebump = '--nodebump'
             debump_flag = ''
-            while not all(correction_attempt.residues[res_id].side_chain_correct for res_id in cluster.err_ress.keys()):
+            while not all(correction_attempt.residues[res_id].side_chain_correct
+                          for res_id in cluster.err_ress.keys()):
                 if correction_level > max_error_distance or pdb2pqr_problem:
                     if not pdb2pqr_problem and pdb2pqr_nodebump:
                         print_output('INFO: trying with debump...', self._silent)
@@ -543,7 +558,8 @@ class Protein:
                         debump_flag = '_d'
                         cluster.debump = True
                     else:
-                        print_output('INFO: failure', self._silent)
+                        print_output(f'INFO: failure'
+                                    , self._silent)
                         break
 
                 cutout_file = f'{correction_dir}/level{correction_level}.pdb'
@@ -579,7 +595,8 @@ class Protein:
 
                 # load the correction attempt output file to check successfulness
                 if not pdb2pqr_problem:
-                    correction_attempt = Protein(output_file)
+                    correction_attempt = Protein(path           = output_file,
+                                                 replica_process= True)
 
                 correction_level += 1
 
@@ -599,14 +616,24 @@ class Protein:
             self.side_chains_correct = True
 
         # write the corrected cluster into the output file
-        for i, cluster in enumerate([cluster for cluster in self.clusters if cluster.correct_side_chain_wise], start=1):
-            cluster_bio = PDBParser(QUIET=True).get_structure(id    = f'cluster{i}',
+        for i, cluster in enumerate((cluster for cluster in self.clusters if cluster.correct_side_chain_wise), start=1):
+            cluster_bio : BioStructure = PDBParser(QUIET=True).get_structure(id    = f'cluster{i}',
                                                               file  = cluster.file)
+            kdtree      : BioNeighbourSearch    = BioNeighbourSearch(list(cluster_bio.get_atoms()))
+            bio_residues: dict[int, BioResidue] = {residue.id[1]: residue
+                                                    for residue in cluster_bio.get_residues()}
+            cluster.inner_cluster = self._find_neighbours_ids(bio_residues  = bio_residues,
+                                                              cluster_ress  = set(cluster.err_ress.values()),
+                                                              kdtree        = kdtree,
+                                                              limit         = self._surroundings_distance/2)
             for atom in cluster_bio.get_atoms():
-                try:
-                    self._bio_structure[0]['A'][atom.get_parent().id][atom.name].coord = atom.coord
-                except KeyError:
-                    continue
+                # write only the inner parts of the cluster
+                if atom.get_parent().get_id()[1] in cluster.inner_cluster | cluster.err_ress.keys():
+                    # remove the OXT atom built for the cluster
+                    try:
+                        self._bio_structure[0]['A'][atom.get_parent().id][atom.name].coord = atom.coord
+                    except KeyError:
+                        continue
         io.save(self._final_file_path)
 
 
@@ -646,6 +673,7 @@ class StructureIntegrityCheckerAndCorrector:
         protein = Protein(self._input_PDB_file,
                           self._output_PDB_file,
                           self._correction_dir,
+                          False,
                           self._silent)
         print_output(f'INFO: {protein.filename} loaded', self._silent)
 
@@ -663,9 +691,9 @@ class StructureIntegrityCheckerAndCorrector:
                 protein.execute_correction()
 
                 # run a check of the final file
-                persistent_side_chain_errors = protein.side_chain_err_ress.keys() - {res_id for cluster in protein.clusters if cluster.correct_side_chain_wise for res_id in cluster.err_ress.keys()}
+                persistent_side_chain_errors = protein.side_chain_err_ress - {res_id for cluster in protein.clusters if cluster.correct_side_chain_wise for res_id in cluster.err_ress.keys()}
                 final_protein = Protein(self._output_PDB_file)
-                if final_protein.side_chain_err_ress.keys() != persistent_side_chain_errors or final_protein.backbone_errors != protein.backbone_errors:
+                if final_protein.side_chain_err_ress != persistent_side_chain_errors or final_protein.backbone_errors != protein.backbone_errors:
                     print_output('ERROR: pdb2pqr failed to correct the protein. The Correction result column in the following table is irrelevant.', self._silent)
                     for cluster in protein.clusters:
                         cluster.correct_side_chain_wise = False
@@ -695,14 +723,16 @@ class StructureIntegrityCheckerAndCorrector:
                                                                       cluster.iterations,
                                                                       cluster.debump,
                                                                       cluster.pdb2pqr_error,
-                                                                      cluster.cycle_confid_log) for cluster in protein.clusters],
+                                                                      cluster.cycle_confid_log
+                                                                      )
+                                                                     for cluster in protein.clusters],
                                                                     protein.side_chains_correct)
                     if protein.pdb2pqr_errors_log:
                         self._logger.pdb2pqr_error_log[protein.name] = protein.pdb2pqr_errors_log
 
             if not protein.backbone_correct:
                 print_output(f'INFO: In {protein.filename}, backbone errors were found in these residues:', self._silent)
-                chain_errors_string = '; '.join(list(map(str, protein.backbone_err_ress)))
+                chain_errors_string = ', '.join(list(map(str, protein.backbone_err_ress)))
                 print_output(chain_errors_string, self._silent)
                 self._log += (f'--------------------------\n'
                               f'Chain errors\n'
@@ -725,7 +755,7 @@ class StructureIntegrityCheckerAndCorrector:
             self._log += '\n'
             if self._log_file:
                 self._log_file = abspath(self._log_file)
-                makedirs(name       =dirname(self._log_file),
+                makedirs(name       = dirname(self._log_file),
                          exist_ok   = True)
                 with open(self._log_file, mode='a') as log_file:
                     log_file.write(self._log)
